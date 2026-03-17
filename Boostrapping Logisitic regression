@@ -1,0 +1,532 @@
+# Bootstrap Linear Regression
+
+# Import necessary packages
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import shap
+
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (
+    accuracy_score,
+    roc_auc_score,
+    roc_curve,
+    confusion_matrix,
+    classification_report
+)
+
+# Set random seed for reproducibility
+RANDOM_STATE = 13
+np.random.seed(RANDOM_STATE)
+
+# Load in the data
+fyle = pd.read_csv("/mnt/DATA3/block_course/tf_profiling/results/final_results_corrected.tsv", sep="\t")
+metadata = pd.read_csv("/mnt/DATA2/cfDNA_finaledb/metadata.tsv",  sep= "\t")
+
+merged = pd.merge(
+    fyle,
+    metadata,
+    on="sample",      # join key
+)
+
+metadata["cancer_presence"] = np.where(metadata["Patient Type"] == "Healthy", 0, 1)
+
+merged = merged[[ "sample", "TF", "mean_coverage", "central_coverage", "amplitude"]]
+
+def pivot_features(df):
+    wide = df.pivot_table(
+        index='sample',
+        columns='TF',
+        values=['mean_coverage','central_coverage','amplitude'],
+    )
+    wide.columns = [f"{feat}_{tf}" for feat, tf in wide.columns]
+    return wide.reset_index()
+
+df = pivot_features(merged)
+
+
+
+
+def pivot_features(df):
+    wide = df.pivot_table(
+        index='sample',
+        columns='TF',
+        values=['mean_coverage','central_coverage','amplitude'],
+    )
+    wide.columns = [f"{feat}_{tf}" for feat, tf in wide.columns]
+    return wide.reset_index()
+
+df = pivot_features(merged)
+
+data = df.merge(metadata[["cancer_presence", "sample"]], on = "sample")
+
+
+# 1. Create X (features) and y (labels)
+X = data.drop(columns=['sample', 'cancer_presence'])
+y = data['cancer_presence']
+
+# 2. Verify shapes of X and y
+print(f"X shape: {X.shape}")
+print(f"y shape: {y.shape}")
+
+
+X_boot, X_val, y_boot, y_val = train_test_split(
+    X, y,
+    test_size=0.2,
+    stratify=y,
+    random_state=RANDOM_STATE
+)
+
+
+##################################################################################
+
+def stratified_bootstrap(X, y, random_state=None):
+    """
+    Return (X_resampled, y_resampled) with correct stratified sampling.
+    Works for pandas DataFrame/Series.
+    """
+    rng = np.random.RandomState(random_state)
+    classes = np.unique(y)
+
+    sampled_indices = []
+
+    for c in classes:
+        idx_c = np.where(y == c)[0]        # row positions
+        sampled_c = rng.choice(idx_c, size=len(idx_c), replace=True)
+        sampled_indices.append(sampled_c)
+
+    sampled_indices = np.concatenate(sampled_indices)
+    rng.shuffle(sampled_indices)
+
+    return X.iloc[sampled_indices], y.iloc[sampled_indices]
+
+
+n_bootstrap = 100
+bootstrap_results = {
+    "C parameters": [],
+    "PCA components": [],
+    "train AUC": [],
+    "test AUC": [],
+    "train accuracy": [],
+    "test accuracy": [],
+    "train probs": [],     # <--- Added
+    "test probs": [],      # <--- Added
+    "test true": []        # <--- Added
+}
+
+for i in range(n_bootstrap):
+    # 1) Stratified bootstrap 
+    X_resampled, y_resampled = stratified_bootstrap(X_boot, y_boot, random_state=i)
+
+    # 2) Train/test split
+    X_resampled_train, X_resampled_test, y_resampled_train, y_resampled_test = train_test_split(
+        X_resampled,
+        y_resampled,
+        test_size=0.2,
+        random_state=42,
+        stratify=y_resampled
+    )
+
+    # 3) Pipeline
+    pipe = Pipeline([
+        ("scaling", StandardScaler()),
+        ("pca", PCA(random_state=RANDOM_STATE)),
+        ("classifier", LogisticRegression(
+            class_weight='balanced',
+            max_iter=500,
+            random_state=RANDOM_STATE,
+            solver='saga',
+            penalty="l2"
+        ))
+    ])
+
+    # 4) Grid search
+    param_grid = {
+        'classifier__C': [0.001, 0.01, 0.1, 1, 10, 100],
+        'pca__n_components': [10, 20, 30, 50, 75, 100]
+    }
+
+    clf_cv = GridSearchCV(
+        pipe,
+        param_grid=param_grid,
+        cv=10,
+        scoring='roc_auc',
+        n_jobs=-1,
+        verbose=1,
+        refit=True
+    )
+
+    clf_cv.fit(X_resampled_train, y_resampled_train)
+
+    best_c = clf_cv.best_params_["classifier__C"]
+    best_n_components = clf_cv.best_params_["pca__n_components"]
+    best_model = clf_cv.best_estimator_
+
+    # --- Probabilities and metrics ---
+    y_train_prob = best_model.predict_proba(X_resampled_train)[:, 1]
+    y_train_pred = (y_train_prob > 0.5).astype(int)
+    train_acc = accuracy_score(y_resampled_train, y_train_pred)
+    train_auc = roc_auc_score(y_resampled_train, y_train_prob)
+
+    y_test_prob = best_model.predict_proba(X_resampled_test)[:, 1]
+    y_test_pred = (y_test_prob > 0.5).astype(int)
+    test_acc = accuracy_score(y_resampled_test, y_test_pred)
+    test_auc = roc_auc_score(y_resampled_test, y_test_prob)
+
+    # Store everything
+    bootstrap_results["C parameters"].append(best_c)
+    bootstrap_results["PCA components"].append(best_n_components)
+    bootstrap_results["train AUC"].append(train_auc)
+    bootstrap_results["test AUC"].append(test_auc)
+    bootstrap_results["train accuracy"].append(train_acc)
+    bootstrap_results["test accuracy"].append(test_acc)
+
+    bootstrap_results["train probs"].append(y_train_prob)
+    bootstrap_results["test probs"].append(y_test_prob)
+    bootstrap_results["test true"].append(y_resampled_test.values)
+
+##################################################################################
+
+fprs = []
+tprs = []
+
+for y_true, y_prob in zip(bootstrap_results["test true"], bootstrap_results["test probs"]):
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    fprs.append(fpr)
+    tprs.append(tpr)
+
+
+# %% Cell 8
+import numpy as np
+from sklearn.metrics import roc_curve
+import matplotlib.pyplot as plt
+
+# Collect FPR/TPR values across all bootstraps
+mean_fpr = np.linspace(0, 1, 200)  # fixed grid for interpolation
+tprs = []
+aucs = []
+
+for y_true, y_prob in zip(bootstrap_results["test true"], bootstrap_results["test probs"]):
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    
+    # Interpolate TPR at common FPR points
+    tpr_interp = np.interp(mean_fpr, fpr, tpr)
+    tpr_interp[0] = 0.0
+    tprs.append(tpr_interp)
+
+# Convert to numpy
+tprs = np.array(tprs)
+
+# Compute mean ROC and 95% CI
+mean_tpr = tprs.mean(axis=0)
+std_tpr = tprs.std(axis=0)
+
+# 95% confidence interval
+tpr_upper = np.minimum(mean_tpr + 1.96 * std_tpr, 1)
+tpr_lower = np.maximum(mean_tpr - 1.96 * std_tpr, 0)
+
+# Final mean AUC
+from sklearn.metrics import roc_auc_score
+mean_auc = np.mean(bootstrap_results["test AUC"])
+std_auc = np.std(bootstrap_results["test AUC"])
+
+# --- Plot ---
+plt.figure(figsize=(8, 6))
+
+# CI band
+plt.fill_between(
+    mean_fpr,
+    tpr_lower,
+    tpr_upper,
+    alpha=0.25,
+    label='95% Confidence Interval'
+)
+
+# Mean ROC curve
+plt.plot(
+    mean_fpr,
+    mean_tpr,
+    lw=2,
+    label=f"Mean ROC (AUC = {mean_auc:.3f} ± {std_auc:.3f})"
+)
+
+# Diagonal line
+plt.plot([0, 1], [0, 1], linestyle='--', color='grey')
+
+plt.xlabel("False Positive Rate", fontsize = 13)
+plt.ylabel("True Positive Rate", fontsize = 13)
+plt.title("ROC Curve with 95% Confidence Interval (Bootstrap) - Logisitic Regression")
+plt.legend(loc="lower right")
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig("ROC_plot_logisitc.png")
+plt.show()
+
+
+
+def stratified_bootstrap(X, y, random_state=None):
+    """
+    Return (X_resampled, y_resampled) with correct stratified sampling.
+    Works for pandas DataFrame/Series.
+    """
+    rng = np.random.RandomState(random_state)
+    classes = np.unique(y)
+
+    sampled_indices = []
+
+    for c in classes:
+        idx_c = np.where(y == c)[0]        # row positions
+        sampled_c = rng.choice(idx_c, size=len(idx_c), replace=True)
+        sampled_indices.append(sampled_c)
+
+    sampled_indices = np.concatenate(sampled_indices)
+    rng.shuffle(sampled_indices)
+
+    # IMPORTANT: use iloc so we index rows, not columns
+    return X.iloc[sampled_indices], y.iloc[sampled_indices]
+
+############################################
+
+
+
+n_bootstrap = 100
+bootstrap_results = {"C parameters": [],
+                     "PCA components": [],
+                     "train AUC": [],
+                     "test AUC": [],
+                     "train accuracy": [],
+                     "test accuracy": []}
+
+for i in range(n_bootstrap):
+    # 1) Stratified bootstrap sample of training data
+    X_resampled, y_resampled = stratified_bootstrap(X_boot, y_boot, random_state=i)
+
+    # 2) Stratified train/test split on the bootstrapped sample
+    X_resampled_train, X_resampled_test, y_resampled_train, y_resampled_test = train_test_split(
+        X_resampled,
+        y_resampled,
+        test_size=0.2,
+        random_state=42,
+        stratify=y_resampled
+    )
+
+    # Now have train and test bootstrap, define pipeline and grid search
+    pipe = Pipeline(
+    [
+        ("scaling", StandardScaler()),
+        ('pca', PCA(random_state=RANDOM_STATE)),
+        ("classifier", LogisticRegression(
+        class_weight='balanced',
+        max_iter=500,
+        random_state=RANDOM_STATE,
+        solver='saga',
+        penalty = "l2"
+    ))
+    ])
+
+    param_grid = [
+        {
+            'classifier__C': [0.001, 0.01, 0.1, 1, 10, 100],
+            'pca__n_components': [10, 20, 30, 50, 75, 100]
+        },
+    ]
+
+    clf_cv = GridSearchCV(
+    pipe,
+    param_grid=param_grid,
+    cv=10,
+    scoring='roc_auc',
+    n_jobs=-1,
+    verbose=1,
+    refit=True #default you refit the best one on the whole train
+    )
+
+    # Now we acc fit this shit, and get the best one for the cross validation
+    clf_cv.fit(X_resampled_train, y_resampled_train)
+    best_c = clf_cv.best_params_["classifier__C"]
+    best_n_components = clf_cv.best_params_["pca__n_components"]
+    best_model = clf_cv.best_estimator_
+
+    y_train_prob = best_model.predict_proba(X_resampled_train)[:, 1]
+    y_train_pred = best_model.predict(X_resampled_train)
+    train_acc = accuracy_score(y_resampled_train, y_train_pred)
+    train_auc = roc_auc_score(y_resampled_train, y_train_prob)
+
+    y_test_prob = best_model.predict_proba(X_resampled_test)[:, 1]
+    y_test_pred = best_model.predict(X_resampled_test)
+    test_acc = accuracy_score(y_resampled_test, y_test_pred)
+    test_auc = roc_auc_score(y_resampled_test, y_test_prob)
+
+    # Add stuff to my lovely dictionary
+    bootstrap_results["C parameters"].append(best_c)
+    bootstrap_results["PCA components"].append(best_n_components)
+    bootstrap_results["train AUC"].append(train_auc)
+    bootstrap_results["test AUC"].append(test_auc)
+    bootstrap_results["train accuracy"].append(train_acc)
+    bootstrap_results["test accuracy"].append(test_acc)
+
+
+
+                              
+    
+
+##################################################################################
+
+# After bootstrapping, we take the parameters which were best and fit model with these parameters
+
+def finding_best_model(models):
+    C_series = pd.Series(models["C parameters"])
+    PCA_series = pd.Series(models["PCA components"])
+    trainAUC = np.array(models["train AUC"])
+    trainACC = np.array(models["train accuracy"])
+    testAUC  = np.array(models["test AUC"])
+    testACC  = np.array(models["test accuracy"])
+
+    # modes
+    our_c = C_series.mode().iloc[0]
+    our_n = PCA_series.mode().iloc[0]
+
+    # means + CI
+    our_train_AUC = trainAUC.mean()
+    lower_train_AUC, upper_train_AUC = np.quantile(trainAUC, [0.025, 0.975])
+
+    our_train_ACC = trainACC.mean()
+    lower_train_ACC, upper_train_ACC = np.quantile(trainACC, [0.025, 0.975])
+
+    our_test_AUC = testAUC.mean()
+    lower_test_AUC, upper_test_AUC = np.quantile(testAUC, [0.025, 0.975])
+
+    our_test_ACC = testACC.mean()
+    lower_test_ACC, upper_test_ACC = np.quantile(testACC, [0.025, 0.975])
+
+    print("Our cool report:\n"
+          f"C hyperparameter: {our_c}\n"
+          f"PCA components: {our_n}\n"
+          f"train AUC confidence:  [{lower_train_AUC:.3f}, {our_train_AUC:.3f}, {upper_train_AUC:.3f}]\n"
+          f"train ACC confidence:  [{lower_train_ACC:.3f}, {our_train_ACC:.3f}, {upper_train_ACC:.3f}]\n"
+          f"test AUC confidence:   [{lower_test_AUC:.3f}, {our_test_AUC:.3f}, {upper_test_AUC:.3f}]\n"
+          f"test ACC confidence:   [{lower_test_ACC:.3f}, {our_test_ACC:.3f}, {upper_test_ACC:.3f}]"
+    )
+
+    return our_c, our_n
+
+
+our_c, our_n = finding_best_model(bootstrap_results)
+
+##################################################################################
+
+# Look at the stats of the best model, print + report
+
+# --- Final model probabilities ---
+y_train_proba = clf_cv.predict_proba(X_boot)[:, 1]  # train probs on bootstrap set
+y_test_proba = clf_cv.predict_proba(X_val)[:, 1]   # test probs on validation set
+
+# --- ROC curves ---
+fpr_train, tpr_train, _ = roc_curve(y_boot, y_train_proba)
+fpr_test, tpr_test, _ = roc_curve(y_val, y_test_proba)
+
+train_auc = auc(fpr_train, tpr_train)
+test_auc = auc(fpr_test, tpr_test)
+
+# --- Bootstrap CI for test ROC ---
+mean_fpr = np.linspace(0, 1, 200)
+tprs_boot = []
+
+for y_true, y_prob in zip(bootstrap_results["test true"], bootstrap_results["test probs"]):
+    fpr_b, tpr_b, _ = roc_curve(y_true, y_prob)
+    tpr_interp = np.interp(mean_fpr, fpr_b, tpr_b)
+    tpr_interp[0] = 0.0
+    tprs_boot.append(tpr_interp)
+
+tprs_boot = np.array(tprs_boot)
+mean_tpr_boot = tprs_boot.mean(axis=0)
+std_tpr_boot = tprs_boot.std(axis=0)
+tpr_upper = np.minimum(mean_tpr_boot + 1.96*std_tpr_boot, 1)
+tpr_lower = np.maximum(mean_tpr_boot - 1.96*std_tpr_boot, 0)
+
+
+# %% Cell 12
+# Define the split within our baby
+X_boot, X_val, y_boot, y_val = train_test_split(
+    X, y,
+    test_size=0.2,
+    stratify=y,
+    random_state=RANDOM_STATE
+)
+
+
+
+# Define the pipeline which fits the best model
+pipe = Pipeline([
+    ("scaling", StandardScaler()),
+    ("pca", PCA(n_components=our_n, random_state=RANDOM_STATE)),
+    ("classifier", LogisticRegression(
+        C= our_c,
+        class_weight="balanced",
+        max_iter=5000,
+        random_state=RANDOM_STATE,
+        solver="saga",
+        penalty="l2"
+    ))
+])
+
+#Fit the pipeline on the bootstrap training set
+pipe.fit(X_boot, y_boot)
+
+#Predict on the validation set
+y_val_pred = pipe.predict(X_val)
+
+# 3) Classification report
+report = classification_report(y_val, y_val_pred, digits=4)
+print("Validation Classification Report:\n")
+print(report)
+
+
+##################################################################################
+
+# Check the results and visualizations
+
+if test_acc > train_acc + 0.05:
+    print("RED FLAG: Test accuracy > training accuracy!")
+    print("   This is very suspicious - check for data leakage!")
+elif test_acc > train_acc:
+    print(" Warning: Test slightly higher than training (could be luck, but verify your pipeline)")
+else:
+    print("Training >= test accuracy (expected)")
+
+# Check 2: Difference shouldn't be huge
+acc_diff = train_acc - test_acc
+if acc_diff > 0.20:
+    print(f" RED FLAG: {acc_diff:.1%} gap between train and test!")
+    print("   Severe overfitting - your model memorized the training data!")
+elif acc_diff > 0.10:
+    print(f"Warning: {acc_diff:.1%} gap suggests some overfitting")
+else:
+    print(f"✓ Reasonable gap ({acc_diff:.1%}) between train and test")
+
+
+# 1) Get predicted probabilities for the positive class
+y_val_prob = pipe.predict_proba(X_val)[:, 1]
+
+# 2) Compute ROC curve
+fpr, tpr, thresholds = roc_curve(y_val, y_val_prob)
+auc_val = roc_auc_score(y_val, y_val_prob)
+
+# 3) Plot
+plt.figure(figsize=(7, 7))
+plt.plot(fpr, tpr, color='blue', lw=2, label=f'ROC curve (AUC = {auc_val:.3f})')
+plt.plot([0, 1], [0, 1], color='grey', lw=1, linestyle='--', label='Random chance')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve - Validation Set')
+plt.legend(loc='lower right')
+plt.grid(True)
+plt.show()
+
