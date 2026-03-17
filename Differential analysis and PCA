@@ -1,0 +1,358 @@
+# =============================================================================
+# Differential TF Accessibility Analysis
+# cfDNA Cancer vs. Healthy Cohort
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Libraries
+# -----------------------------------------------------------------------------
+
+library(limma)
+library(edgeR)
+library(statmod)
+library(ggplot2)
+library(ggrepel)
+library(plotly)
+library(pheatmap)
+library(tidyverse)
+library(dplyr)
+library(purrr)
+library(msigdbr)
+
+# -----------------------------------------------------------------------------
+# Load Data
+# -----------------------------------------------------------------------------
+
+samples_metadata <- read.csv("/mnt/DATA2/cfDNA_finaledb/metadata.tsv", sep = "\t", header = TRUE)
+
+merged <- read.csv("/mnt/DATA3/block_course/tf_profiling/results/final_results_corrected.tsv", sep = "\t", header = TRUE)
+
+markers <- read.csv("/mnt/DATA3/block_course/Mateusz/marker_tfs.tsv", sep = "\t", header = TRUE, stringsAsFactors = TRUE)
+
+# -----------------------------------------------------------------------------
+# Preprocess Metadata
+# -----------------------------------------------------------------------------
+
+# Add cancer presence label and restrict to cfDNA samples
+samples_metadata <- samples_metadata %>%
+  mutate(Cancer.presence = ifelse(Patient.Type == "Healthy", "Healthy", "Cancer")) %>%
+  mutate(Cancer.presence = as.factor(Cancer.presence)) %>%
+  filter(Sample.Type == "cfDNA") %>%
+  filter(Patient.Type != "Duodenal Cancer")
+
+# -----------------------------------------------------------------------------
+# Build Feature Matrices
+# -----------------------------------------------------------------------------
+
+merged <- merged %>% mutate(ratio = central_coverage / mean_coverage)
+
+mean_cov_df <- merged %>%
+  select(TF, sample, mean_coverage) %>%
+  pivot_wider(names_from = sample, values_from = mean_coverage)
+
+central_cov_df <- merged %>%
+  select(TF, sample, central_coverage) %>%
+  pivot_wider(names_from = sample, values_from = central_coverage)
+
+amplitude_df <- merged %>%
+  select(TF, sample, amplitude) %>%
+  pivot_wider(names_from = sample, values_from = amplitude)
+
+# -----------------------------------------------------------------------------
+# Helper: Prepare limma Inputs
+# -----------------------------------------------------------------------------
+
+# Aligns the feature matrix with a metadata subset, recodes Patient.Type,
+# and returns a list with the expression matrix and matched metadata.
+
+prepare_limma_inputs <- function(central_cov_df, meta) {
+  mat <- central_cov_df %>%
+    column_to_rownames("TF") %>%
+    as.matrix()
+
+  common_samples <- intersect(colnames(mat), meta$sample)
+  cat("Number of common samples:", length(common_samples), "\n")
+
+  mat <- mat[, common_samples, drop = FALSE]
+  meta_sub <- meta[meta$sample %in% common_samples, ]
+  meta_sub <- meta_sub[match(colnames(mat), meta_sub$sample), ]
+
+  cat("Matrix columns:", ncol(mat), "\n")
+  cat("Metadata rows:", nrow(meta_sub), "\n")
+  cat("Names match:", all(colnames(mat) == meta_sub$sample), "\n")
+
+  if (any(is.na(meta_sub$sample))) stop("NAs found in metadata after matching!")
+
+  meta_sub$Patient.Type <- fct_recode(
+    meta_sub$Patient.Type,
+    TumorA           = "Tumor A",
+    Healthy          = "Healthy",
+    Breast_Cancer    = "Breast Cancer",
+    Lung_Cancer      = "Lung Cancer",
+    TumorB           = "Tumor B",
+    Pancreatic_Cancer = "Pancreatic Cancer",
+    Bile_Duct_Cancer = "Bile Duct Cancer",
+    Gastric_Cancer   = "Gastric cancer"
+  )
+
+  meta_sub$Patient.Type <- factor(
+    meta_sub$Patient.Type,
+    levels = c("Healthy", "TumorA", "TumorB", "Breast_Cancer",
+               "Lung_Cancer", "Pancreatic_Cancer", "Bile_Duct_Cancer", "Gastric_Cancer")
+  )
+
+  list(emat = mat, meta_sub = meta_sub)
+}
+
+# -----------------------------------------------------------------------------
+# Helper: Run Per-Cancer-Type limma
+# -----------------------------------------------------------------------------
+
+run_limma_cancer_types <- function(emat, meta_sub) {
+  design <- model.matrix(~ 0 + Patient.Type + tfx, data = meta_sub)
+  patient_type_cols <- grep("^Patient\\.Type", colnames(design))
+  colnames(design)[patient_type_cols] <- levels(meta_sub$Patient.Type)
+
+  contr <- makeContrasts(
+    Colorectal  = TumorA - Healthy,
+    Ovarian     = TumorB - Healthy,
+    Breast      = Breast_Cancer - Healthy,
+    Lung        = Lung_Cancer - Healthy,
+    Pancreatic  = Pancreatic_Cancer - Healthy,
+    Bile        = Bile_Duct_Cancer - Healthy,
+    Gastric     = Gastric_Cancer - Healthy,
+    levels = design
+  )
+
+  fit <- lmFit(emat, design)
+  fit <- contrasts.fit(fit, contr)
+  fit <- eBayes(fit, robust = TRUE)
+
+  all_results <- lapply(colnames(contr), function(contrast_name) {
+    res <- topTreat(fit, coef = contrast_name, number = Inf)
+    res$FC <- 2^(res$logFC)
+    res$percentChange <- (res$FC - 1) * 100
+    res
+  })
+  names(all_results) <- colnames(contr)
+
+  cat("Available results:", names(all_results), "\n")
+  all_results
+}
+
+# -----------------------------------------------------------------------------
+# Analysis 1: All Samples (no tfx filter)
+# -----------------------------------------------------------------------------
+
+inputs_all <- prepare_limma_inputs(central_cov_df, samples_metadata)
+all_results <- run_limma_cancer_types(inputs_all$emat, inputs_all$meta_sub)
+
+# -----------------------------------------------------------------------------
+# Analysis 2: tfx-filtered Samples (tfx > 0.03 for cancer, all healthy)
+# -----------------------------------------------------------------------------
+
+meta_filtered <- samples_metadata %>%
+  filter(
+    (Cancer.presence == "Cancer" & tfx > 0.03) |
+    (Cancer.presence == "Healthy")
+  )
+
+inputs_filt <- prepare_limma_inputs(central_cov_df, meta_filtered)
+all_results_filtered <- run_limma_cancer_types(inputs_filt$emat, inputs_filt$meta_sub)
+
+# -----------------------------------------------------------------------------
+# Analysis 3: Cancer vs. Healthy (binary, no tfx covariate)
+# -----------------------------------------------------------------------------
+
+mat_bin <- central_cov_df %>% column_to_rownames("TF") %>% as.matrix()
+common_bin  <- intersect(colnames(mat_bin), samples_metadata$sample)
+mat_bin     <- mat_bin[, common_bin, drop = FALSE]
+meta_bin    <- samples_metadata[match(common_bin, samples_metadata$sample), ]
+
+meta_bin$Cancer.presence <- factor(meta_bin$Cancer.presence, levels = c("Healthy", "Cancer"))
+design_bin <- model.matrix(~ 0 + Cancer.presence, data = meta_bin)
+colnames(design_bin) <- levels(meta_bin$Cancer.presence)
+
+contr_bin <- makeContrasts(Cancer.vs.Healthy = Cancer - Healthy, levels = design_bin)
+
+fit_bin <- lmFit(mat_bin, design_bin)
+fit_bin <- contrasts.fit(fit_bin, contr_bin)
+fit_bin <- eBayes(fit_bin, robust = TRUE)
+
+res_binary <- topTreat(fit_bin, coef = "Cancer.vs.Healthy", number = Inf)
+res_binary$FC           <- 2^(res_binary$logFC)
+res_binary$percentChange <- (res_binary$FC - 1) * 100
+
+# -----------------------------------------------------------------------------
+# Volcano Plot Helper
+# -----------------------------------------------------------------------------
+
+plot_volcano <- function(df, title, use_adj = FALSE) {
+  y_var  <- if (use_adj) "adj.P.Val" else "P.Value"
+  color  <- if (use_adj) "red" else "green"
+  y_lab  <- if (use_adj) "-log10(FDR)" else "-log10(p-value)"
+
+  df$y_val   <- -log10(df[[y_var]])
+  df$sig     <- df[[y_var]] < 0.05
+
+  ggplot(df, aes(x = logFC, y = y_val)) +
+    geom_point(aes(color = sig), alpha = 0.7, size = 2) +
+    scale_color_manual(values = c("gray", color)) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dotted") +
+    labs(x = "log2 Fold Change (Cancer – Healthy)", y = y_lab, title = title) +
+    theme_bw() +
+    theme(
+      axis.text  = element_text(size = 10),
+      axis.title = element_text(size = 15),
+      plot.title = element_text(size = 15, face = "bold")
+    )
+}
+
+# Plot all per-cancer-type contrasts (nominal p-value)
+for (cancer in names(all_results)) {
+  print(plot_volcano(all_results[[cancer]], paste(cancer, "- Differential TF accessibility"), use_adj = FALSE))
+}
+
+# Plot all per-cancer-type contrasts (FDR)
+for (cancer in names(all_results)) {
+  print(plot_volcano(all_results[[cancer]], paste(cancer, "- Differential TF accessibility"), use_adj = TRUE))
+}
+
+# Save example plot
+plot_volcano(all_results[["Colorectal"]], "Colorectal Cancer - Differential TF accessibility", use_adj = TRUE)
+ggsave("diff_plot_colorectal.png", dpi = 600, width = 10, height = 7)
+
+# -----------------------------------------------------------------------------
+# PCA
+# -----------------------------------------------------------------------------
+
+pca_mat <- central_cov_df %>% column_to_rownames("TF") %>% as.matrix()
+pca     <- prcomp(t(pca_mat), scale. = TRUE)
+
+df_pca <- data.frame(
+  sample = colnames(pca_mat),
+  PC1    = pca$x[, 1],
+  PC2    = pca$x[, 2]
+) %>%
+  merge(samples_metadata[, c("sample", "tfx", "Patient.Type", "Cancer.presence")], by = "sample") %>%
+  mutate(
+    tfx_bin = factor(ifelse(tfx < 0.02, "< 0.02", "≥ 0.02"), levels = c("< 0.02", "≥ 0.02"))
+  )
+
+ggplot(df_pca, aes(PC1, PC2, color = Patient.Type, shape = tfx_bin)) +
+  geom_point(size = 3) +
+  geom_text_repel(aes(label = sample), size = 3) +
+  theme_bw() +
+  ggtitle("PCA of Samples (TF accessibility) - Central Coverage")
+
+# -----------------------------------------------------------------------------
+# Marker TF Heatmap (filtered results)
+# -----------------------------------------------------------------------------
+
+# Build logFC matrix for marker TFs across all cancer types
+all_sig_tfs <- unique(markers$TF)
+
+merged_df <- map_df(all_results_filtered, ~ {
+  .x %>%
+    as.data.frame() %>%
+    rownames_to_column("TF") %>%
+    select(TF, logFC) %>%
+    filter(TF %in% all_sig_tfs)
+}, .id = "Cancer")
+
+final_df <- merged_df %>%
+  pivot_wider(names_from = Cancer, values_from = logFC)
+
+mat_markers <- final_df %>%
+  column_to_rownames("TF") %>%
+  as.matrix()
+
+mat_markers_scaled <- t(scale(t(mat_markers)))
+
+# Hierarchical clustering
+row_dist <- dist(mat_markers_scaled, method = "euclidean")
+col_dist <- dist(t(mat_markers_scaled), method = "euclidean")
+row_hc   <- hclust(row_dist, method = "complete")
+col_hc   <- hclust(col_dist, method = "complete")
+
+pheatmap(
+  mat_markers_scaled[row_hc$order, col_hc$order],
+  cluster_rows     = FALSE,
+  cluster_cols     = FALSE,
+  color            = colorRampPalette(c("blue", "white", "red"))(50),
+  main             = "Marker TF Accessibility Heatmap (Hierarchical Clustered)",
+  na_col           = "grey90"
+)
+
+# -----------------------------------------------------------------------------
+# All-TF Heatmap (all_results logFC, first column per cancer)
+# -----------------------------------------------------------------------------
+
+combined_df <- bind_cols(
+  lapply(names(all_results), function(cancer) {
+    df <- all_results[[cancer]][, 1, drop = FALSE]
+    colnames(df) <- cancer
+    df
+  })
+)
+
+combined_scaled <- t(scale(t(combined_df)))
+
+row_hc2 <- hclust(dist(combined_scaled),   method = "complete")
+col_hc2 <- hclust(dist(t(combined_scaled)), method = "complete")
+
+pheatmap(
+  combined_scaled,
+  color          = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks         = seq(-2, 2, length.out = 101),
+  cluster_rows   = row_hc2,
+  cluster_cols   = col_hc2,
+  show_rownames  = FALSE,
+  show_colnames  = TRUE,
+  fontsize_col   = 14,
+  fontsize_main  = 16,
+  main           = "TF Accessibility Heatmap (All TFs, Hierarchical Clustered)",
+  legend_breaks  = c(-2, -1, 0, 1, 2),
+  legend_labels  = c("-2", "-1", "0", "1", "2"),
+  treeheight_row = 0,
+  treeheight_col = 0,
+  width          = 10,
+  height         = 14
+)
+
+# -----------------------------------------------------------------------------
+# GSEA Utilities (requires fgsea — uncomment to use)
+# -----------------------------------------------------------------------------
+
+# library(fgsea)
+#
+# m_df     <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME")
+# reactome <- m_df %>% split(x = .$gene_symbol, f = .$gs_name)
+#
+# fgsea_tidy <- function(df, fgsea_sets) {
+#   ranks <- df %>%
+#     rownames_to_column("X") %>%
+#     arrange(desc(avg_log2FC)) %>%
+#     select(X, avg_log2FC) %>%
+#     deframe()
+#
+#   fgsea(fgsea_sets, stats = ranks, nperm = 50000) %>%
+#     as_tibble() %>%
+#     arrange(desc(NES)) %>%
+#     select(-leadingEdge, -ES, -nMoreExtreme) %>%
+#     mutate(
+#       pathway = str_replace(pathway, "REACTOME_", ""),
+#       pathway = str_replace_all(pathway, "_", " ")
+#     )
+# }
+#
+# plot_gsea <- function(gsea_res, title = "GSEA results", p = 0.05, tops = 20, stringwidth = 40) {
+#   ggplot(gsea_res %>% filter(padj < p) %>% head(tops), aes(reorder(pathway, NES), NES)) +
+#     geom_col(aes(fill = NES < 0)) +
+#     coord_flip() +
+#     labs(title = title, y = "Normalized Enrichment Score") +
+#     scale_x_discrete(labels = function(x) str_wrap(x, width = stringwidth)) +
+#     theme_classic() +
+#     theme(axis.text = element_text(size = 5), axis.title.y = element_blank())
+# }
