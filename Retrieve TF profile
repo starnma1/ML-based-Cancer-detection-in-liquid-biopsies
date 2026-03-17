@@ -1,0 +1,240 @@
+# =============================================================================
+# TF Profiling Analysis
+# Griffin nucleosome profiling — loading, smoothing, normalization, feature extraction
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Libraries
+# -----------------------------------------------------------------------------
+
+import numpy as np
+import pandas as pd
+import glob
+import os
+import matplotlib.pyplot as plt
+from scipy.signal import savgol_filter
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+
+sample_healthy = "EE87923"
+sample_cancer  = "EE87894"
+
+base_healthy = "/mnt/DATA3/block_course/tf_profiling/results/samples/{}/griffin_profiling/intermediate".format(sample_healthy)
+base_cancer  = "/mnt/DATA3/block_course/tf_profiling/results/samples/{}/griffin_profiling/intermediate".format(sample_cancer)
+
+tf_names = ["SRSF9", "SOX9"]
+
+# -----------------------------------------------------------------------------
+# Step 1: Discover TF Names from File Paths
+# -----------------------------------------------------------------------------
+
+def get_tf_names(directory, base):
+    """Extract unique TF names from a list of .npz file paths."""
+    tf_names = []
+    for name in directory:
+        name = name.split(base + "/")[1]
+        tf = name.split("_chr")[0]
+        if tf not in tf_names:
+            tf_names.append(tf)
+    return tf_names
+
+all_files = glob.glob(os.path.join(base_healthy, "*.npz"))
+names_of_tf = get_tf_names(all_files, base_healthy)
+print(names_of_tf)
+
+# -----------------------------------------------------------------------------
+# Step 2: Load .npz Files Per TF and Chromosome
+# -----------------------------------------------------------------------------
+
+def dic_tf_all_chr(tf_names, base):
+    """Load .npz files for each TF across chromosomes 1-21, grouped by TF."""
+    tf_stacks = {}
+    for tf in tf_names:
+        chr_arrays = []
+        for chrom in range(1, 22):
+            pattern = os.path.join(base, f"{tf}*chr{chrom}.npz")
+            files = glob.glob(pattern)
+            for f in files:
+                chr_arrays.append(np.load(f, allow_pickle=True))
+        tf_stacks[tf] = chr_arrays
+    return tf_stacks
+
+dic_healthy = dic_tf_all_chr(tf_names, base_healthy)
+dic_cancer  = dic_tf_all_chr(tf_names, base_cancer)
+
+# -----------------------------------------------------------------------------
+# Step 3: Decompress .npz Archives
+# -----------------------------------------------------------------------------
+
+def decompress_data(dic_with_data):
+    """Convert lazy NpzFile objects to in-memory dicts of arrays."""
+    decompressed_tf_data = {}
+    for tf, npz_list in dic_with_data.items():
+        decompressed_arrays = []
+        for npz_file in npz_list:
+            arrays_in_npz = {key: npz_file[key] for key in npz_file.files}
+            decompressed_arrays.append(arrays_in_npz)
+        decompressed_tf_data[tf] = decompressed_arrays
+    return decompressed_tf_data
+
+dic_healthy2 = decompress_data(dic_healthy)
+dic_cancer2  = decompress_data(dic_cancer)
+
+# -----------------------------------------------------------------------------
+# Step 4: Stack / Average Across Chromosomes
+# -----------------------------------------------------------------------------
+
+def stacking_chromosomes(decompressed_data):
+    """
+    Merge per-chromosome arrays into a single dict per TF.
+    Positions are taken from chromosome 1; all other keys are mean-averaged.
+    """
+    stacked_tf_data = {}
+    for tf, chr_dicts in decompressed_data.items():
+        stacked_dict = {}
+        keys = chr_dicts[0].keys()
+        for key in keys:
+            arrays_to_process = [chr_dict[key] for chr_dict in chr_dicts]
+            if key == "positions":
+                stacked_dict[key] = chr_dicts[0][key]
+            else:
+                stacked_dict[key] = np.mean(np.vstack(arrays_to_process), axis=0)
+        stacked_tf_data[tf] = stacked_dict
+    return stacked_tf_data
+
+dic_healthy3 = stacking_chromosomes(dic_healthy2)
+dic_cancer3  = stacking_chromosomes(dic_cancer2)
+
+# -----------------------------------------------------------------------------
+# Step 5: Smoothing (Savitzky-Golay)
+# -----------------------------------------------------------------------------
+
+def smoothing(tf_names, stacked_data, step=15, length_protect=165, save_plots=False):
+    """
+    Apply Savitzky-Golay smoothing to the corrected signal for each TF.
+    Adds a 'smoothed corrected' key in-place and optionally saves plots.
+    """
+    window = length_protect // step
+    if window % 2 == 0:
+        window += 1
+
+    for i, tf in enumerate(tf_names):
+        stacked_data[tf]["smoothed corrected"] = savgol_filter(
+            stacked_data[tf]["corrected"],
+            window,
+            polyorder=3
+        )
+        plt.figure()
+        plt.plot(stacked_data[tf]["positions"], stacked_data[tf]["smoothed corrected"])
+        plt.title(tf)
+        plt.xlabel("Position")
+        plt.ylabel("Corrected signal (smoothed)")
+        if save_plots:
+            plt.savefig(f"smoothed_{i+1}_{tf}.png")
+        plt.show()
+
+    return stacked_data
+
+dic_healthy3 = smoothing(tf_names, dic_healthy3)
+dic_cancer3  = smoothing(tf_names, dic_cancer3)
+
+# -----------------------------------------------------------------------------
+# Step 6: Normalization
+# -----------------------------------------------------------------------------
+
+def normalization(tf_names, smoothed_data):
+    """Normalize smoothed signal by the mean of the raw corrected signal."""
+    for tf in tf_names:
+        mean = np.mean(smoothed_data[tf]["corrected"])
+        smoothed_data[tf]["smoothed and norm corrected"] = smoothed_data[tf]["smoothed corrected"] / mean
+    return smoothed_data
+
+dic_healthy4 = normalization(tf_names, dic_healthy3)
+dic_cancer4  = normalization(tf_names, dic_cancer3)
+
+# Plot final normalized signals
+for i, tf in enumerate(tf_names):
+    plt.figure()
+    plt.plot(dic_healthy4[tf]["positions"], dic_healthy4[tf]["smoothed and norm corrected"])
+    plt.title(tf)
+    plt.savefig(f"final_{i+1}_{tf}.png")
+
+# -----------------------------------------------------------------------------
+# Step 7: Build Per-TF DataFrames
+# -----------------------------------------------------------------------------
+
+def make_tf_dataframes(tf_names, data):
+    """Assemble a tidy DataFrame of all signal tracks for each TF."""
+    tf_dfs = {}
+    for tf in tf_names:
+        tf_dfs[tf] = pd.DataFrame({
+            "positions":               data[tf]["positions"],
+            "corrected":               data[tf]["corrected"],
+            "uncorrected":             data[tf]["uncorrected"],
+            "smoothed_corrected":      data[tf]["smoothed corrected"],
+            "smoothed_norm_corrected": data[tf]["smoothed and norm corrected"]
+        })
+    return tf_dfs
+
+dic_df_healthy = make_tf_dataframes(names_of_tf, dic_healthy4)
+dic_df_cancer  = make_tf_dataframes(names_of_tf, dic_cancer4)
+
+# -----------------------------------------------------------------------------
+# Step 8: Feature Extraction (mean coverage, central coverage, FFT amplitude)
+# -----------------------------------------------------------------------------
+
+def calculation_matrixes(tf_names, data, fft_window=1000):
+    """
+    For each TF binding site (position == 0), extract three features:
+      - mean_coverage:    mean signal in a +/-1000 bp window  (b)
+      - central_coverage: mean signal in a +/-30 bp window    (a)
+      - fft_amplitude:    dominant FFT peak in +/-fft_window  (c)
+    """
+    results = []
+    for tf in tf_names:
+        tf_binding = data[tf]["positions"]
+        central_positions = tf_binding[tf_binding == 0]
+
+        if len(central_positions) == 0:
+            continue
+
+        for central_position in central_positions.values:
+            # (b) Mean coverage -- large window
+            mask_large    = (tf_binding >= central_position - 1000) & (tf_binding <= central_position + 1000)
+            mean_coverage = np.mean(data[tf]["smoothed_norm_corrected"][mask_large])
+
+            # (a) Central coverage -- small window around binding site
+            mask_small       = (tf_binding >= central_position - 30) & (tf_binding <= central_position + 30)
+            central_coverage = np.mean(data[tf]["smoothed_norm_corrected"][mask_small])
+
+            # (c) FFT amplitude -- dominant frequency (nucleosome periodicity)
+            fft_mask      = (tf_binding >= central_position - fft_window) & \
+                            (tf_binding <= central_position + fft_window)
+            fft_signal    = data[tf]["smoothed_norm_corrected"][fft_mask].values
+            fft_result    = np.fft.fft(fft_signal)
+            fft_magnitude = np.abs(fft_result)
+            amplitude     = np.max(fft_magnitude[1:len(fft_magnitude) // 2])
+
+            # Alternative: restrict to expected nucleosome period (147-200 bp)
+            # freqs = np.fft.fftfreq(len(fft_signal), d=1)
+            # nucleosome_freq_range = (1/200, 1/147)
+            # freq_mask = (np.abs(freqs) >= nucleosome_freq_range[0]) & \
+            #             (np.abs(freqs) <= nucleosome_freq_range[1])
+            # amplitude = np.max(fft_magnitude[freq_mask]) if freq_mask.any() else 0
+
+            results.append({
+                "TF":               tf,
+                "mean_coverage":    mean_coverage,
+                "central_coverage": central_coverage,
+                "fft_amplitude":    amplitude,
+            })
+
+    return pd.DataFrame(results)
+
+result_df_healthy = calculation_matrixes(names_of_tf, dic_df_healthy)
+result_df_cancer  = calculation_matrixes(names_of_tf, dic_df_cancer)
+
+print(result_df_healthy)
+print(result_df_cancer)
